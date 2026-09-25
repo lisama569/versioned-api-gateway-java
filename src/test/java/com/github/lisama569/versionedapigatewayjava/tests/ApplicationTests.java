@@ -1,15 +1,100 @@
 package com.github.lisama569.versionedapigatewayjava.tests;
 
-import org.junit.jupiter.api.Test;
-import org.springframework.boot.test.context.SpringBootTest;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.header;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
-/**
- * @author Vincent
- * @version 1.0
- */
-@SpringBootTest
-public class ApplicationTests {
+import com.github.lisama569.versionedapigatewayjava.gateway.GatewayService;
+import com.github.lisama569.versionedapigatewayjava.idempotency.IdempotencyStore;
+import com.github.lisama569.versionedapigatewayjava.ratelimit.CallerPolicy;
+import com.github.lisama569.versionedapigatewayjava.ratelimit.RateLimiter;
+import com.github.lisama569.versionedapigatewayjava.upstream.SimulatedUpstreamClient;
+import com.github.lisama569.versionedapigatewayjava.versioning.VersionRouter;
+import com.github.lisama569.versionedapigatewayjava.web.GatewayController;
+import com.github.lisama569.versionedapigatewayjava.web.GlobalExceptionHandler;
+import java.util.UUID;
+import java.util.concurrent.atomic.AtomicLong;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.http.MediaType;
+import org.springframework.test.web.servlet.MockMvc;
+import org.springframework.test.web.servlet.setup.MockMvcBuilders;
+
+/** Web 层测试：standalone MockMvc，无网络无端口，验证错误码->HTTP 映射与限流响应头。 */
+class ApplicationTests {
+    private static final Logger log = LoggerFactory.getLogger(ApplicationTests.class);
+
+    private MockMvc mvc;
+
+    @BeforeEach
+    void setUp() {
+        AtomicLong clock = new AtomicLong(0);
+        RateLimiter limiter = new RateLimiter(new CallerPolicy(1, 1.0d, 1, 60_000), clock::get);
+        GatewayService service = new GatewayService(new VersionRouter(), limiter,
+                new SimulatedUpstreamClient(), new IdempotencyStore(), 300, 2);
+        mvc = MockMvcBuilders.standaloneSetup(new GatewayController(service))
+                .setControllerAdvice(new GlobalExceptionHandler())
+                .build();
+    }
+
     @Test
-    public void contentLoad() {
+    void happyPathReturns200() throws Exception {
+        String requestId = UUID.randomUUID().toString();
+        mvc.perform(post("/api/orders").contentType(MediaType.APPLICATION_JSON)
+                        .header("X-Api-Version", "v2")
+                        .header("X-Caller-Id", "caller-A")
+                        .header("X-Idempotency-Key", "k1")
+                        .content("{\"customerId\":\"c1\",\"itemName\":\"i1\",\"quantity\":2}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.version").value("v2"))
+                .andExpect(jsonPath("$.receipt.status").value("ACCEPTED"));
+        log.info("[{}] matched rule=web-happy-path basis='200 with mapped v2 response'", requestId);
+    }
+
+    @Test
+    void missingVersionReturns400WithUnsupportedVersion() throws Exception {
+        String requestId = UUID.randomUUID().toString();
+        mvc.perform(post("/api/orders").contentType(MediaType.APPLICATION_JSON).content("{}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.code").value("UNSUPPORTED_VERSION"))
+                .andExpect(jsonPath("$.requestId").exists());
+        log.info("[{}] matched rule=web-version-routing basis='missing X-Api-Version -> 400 UNSUPPORTED_VERSION'", requestId);
+    }
+
+    @Test
+    void missingRequiredFieldReturns400WithDistinctCode() throws Exception {
+        String requestId = UUID.randomUUID().toString();
+        mvc.perform(post("/api/orders").contentType(MediaType.APPLICATION_JSON)
+                        .header("X-Api-Version", "v2")
+                        .header("X-Caller-Id", "caller-A")
+                        .header("X-Idempotency-Key", "k2")
+                        .content("{\"itemName\":\"i1\",\"quantity\":2}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.code").value("MISSING_REQUIRED_FIELD"));
+        log.info("[{}] matched rule=web-validation basis='missing customerId -> 400 MISSING_REQUIRED_FIELD'", requestId);
+    }
+
+    @Test
+    void quotaExhaustionReturns429WithRetryAfter() throws Exception {
+        String requestId = UUID.randomUUID().toString();
+        // capacity=1 quota=1: 第一次成功，第二次必为配额耗尽（而非瞬时限流）
+        mvc.perform(post("/api/orders").contentType(MediaType.APPLICATION_JSON)
+                .header("X-Api-Version", "v2").header("X-Caller-Id", "caller-A")
+                .header("X-Idempotency-Key", "a1")
+                .content("{\"customerId\":\"c1\",\"itemName\":\"i1\",\"quantity\":1}"))
+                .andExpect(status().isOk());
+
+        mvc.perform(post("/api/orders").contentType(MediaType.APPLICATION_JSON)
+                        .header("X-Api-Version", "v2").header("X-Caller-Id", "caller-A")
+                        .header("X-Idempotency-Key", "a2")
+                        .content("{\"customerId\":\"c1\",\"itemName\":\"i1\",\"quantity\":1}"))
+                .andExpect(status().isTooManyRequests())
+                .andExpect(jsonPath("$.code").value("QUOTA_EXHAUSTED"))
+                .andExpect(header().exists("Retry-After"));
+        log.info("[{}] matched rule=web-quota basis='2nd request after quota=1 -> 429 QUOTA_EXHAUSTED + Retry-After'",
+                requestId);
     }
 }
