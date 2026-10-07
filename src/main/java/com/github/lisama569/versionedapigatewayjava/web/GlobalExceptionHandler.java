@@ -48,6 +48,7 @@ public class GlobalExceptionHandler {
             case RATE_LIMITED, QUOTA_EXHAUSTED -> HttpStatus.TOO_MANY_REQUESTS;
             case UPSTREAM_TIMEOUT -> HttpStatus.GATEWAY_TIMEOUT;
             case UPSTREAM_ERROR, UPSTREAM_MALFORMED_RESPONSE -> HttpStatus.BAD_GATEWAY;
+            case CIRCUIT_OPEN -> HttpStatus.SERVICE_UNAVAILABLE;
         };
     }
 }

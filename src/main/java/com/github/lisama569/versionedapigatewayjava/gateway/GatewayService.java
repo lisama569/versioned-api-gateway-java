@@ -1,5 +1,9 @@
 package com.github.lisama569.versionedapigatewayjava.gateway;
 
+import com.github.lisama569.versionedapigatewayjava.circuitbreaker.CircuitBreaker;
+import com.github.lisama569.versionedapigatewayjava.circuitbreaker.CircuitBreakerConfig;
+import com.github.lisama569.versionedapigatewayjava.circuitbreaker.CircuitBreakerRegistry;
+import com.github.lisama569.versionedapigatewayjava.circuitbreaker.PermitDecision;
 import com.github.lisama569.versionedapigatewayjava.error.ApiException;
 import com.github.lisama569.versionedapigatewayjava.error.ErrorCode;
 import com.github.lisama569.versionedapigatewayjava.idempotency.IdempotencyStore;
@@ -25,17 +29,23 @@ import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
 /**
- * 网关编排：版本映射 -> 限流/配额 -> 幂等回放 -> 上游调用（超时控制 + 归一化 + 限时重试）。
+ * 网关编排：版本映射 -> 限流/配额 -> 幂等回放 -> 熔断放行判定 -> 上游调用（超时控制 + 归一化 + 限时重试）。
+ * 熔断打开时：可降级请求返回可分辨的降级结果（不写入幂等记录），其余快速失败为 CIRCUIT_OPEN。
  * 每个判定环节都打印请求标识、命中规则与判定依据。
  */
 @Service
 public class GatewayService {
     private static final Logger log = LoggerFactory.getLogger(GatewayService.class);
 
+    /** 默认依赖维度名：本网关只有一个上游依赖。 */
+    public static final String DEFAULT_DEPENDENCY = "orders-upstream";
+
     private final VersionRouter router;
     private final RateLimiter rateLimiter;
     private final UpstreamClient upstream;
     private final IdempotencyStore idempotencyStore;
+    private final CircuitBreakerRegistry breakerRegistry;
+    private final String dependencyName;
     private final long upstreamTimeoutMillis;
     private final int maxAttempts;
     private final ExecutorService executor = Executors.newCachedThreadPool();
@@ -49,10 +59,20 @@ public class GatewayService {
 
     public GatewayService(VersionRouter router, RateLimiter rateLimiter, UpstreamClient upstream,
                           IdempotencyStore idempotencyStore, long upstreamTimeoutMillis, int maxAttempts) {
+        this(router, rateLimiter, upstream, idempotencyStore,
+                new CircuitBreakerRegistry(CircuitBreakerConfig.defaults(), System::currentTimeMillis),
+                DEFAULT_DEPENDENCY, upstreamTimeoutMillis, maxAttempts);
+    }
+
+    public GatewayService(VersionRouter router, RateLimiter rateLimiter, UpstreamClient upstream,
+                          IdempotencyStore idempotencyStore, CircuitBreakerRegistry breakerRegistry,
+                          String dependencyName, long upstreamTimeoutMillis, int maxAttempts) {
         this.router = router;
         this.rateLimiter = rateLimiter;
         this.upstream = upstream;
         this.idempotencyStore = idempotencyStore;
+        this.breakerRegistry = breakerRegistry;
+        this.dependencyName = dependencyName;
         this.upstreamTimeoutMillis = upstreamTimeoutMillis;
         this.maxAttempts = maxAttempts;
     }
@@ -67,6 +87,14 @@ public class GatewayService {
 
     public GatewayResponse process(String requestId, String version, String callerId,
                                    String idempotencyKey, String rawJson) {
+        return process(requestId, version, callerId, idempotencyKey, rawJson, false);
+    }
+
+    /**
+     * @param degradeAllowed 熔断打开时是否允许返回降级结果（否则快速失败为 CIRCUIT_OPEN）
+     */
+    public GatewayResponse process(String requestId, String version, String callerId,
+                                   String idempotencyKey, String rawJson, boolean degradeAllowed) {
         log.info("[{}] request received: rule=version-routing version={} caller={} idempotencyKey={}",
                 requestId, version, callerId, idempotencyKey);
 
@@ -101,12 +129,50 @@ public class GatewayService {
             return new GatewayResponse(requestId, adapter.version(), summary(order), true, replay.get());
         }
 
-        // 4. 上游调用（带超时与一次重试，重试携带同一幂等键，不产生重复副作用）
-        UpstreamReceipt receipt = invokeUpstreamWithTimeout(requestId, idempotencyKey, order);
+        // 4. 熔断放行判定：OPEN 期间不再真正打到上游
+        CircuitBreaker breaker = breakerRegistry.breakerFor(dependencyName);
+        PermitDecision permit = breaker.tryAcquirePermit();
+        log.info("[{}] matched rule=circuit-breaker decision={} state={} basis='{}'",
+                requestId, permit.allowed() ? "PERMIT" : "REJECT", permit.state(), permit.basis());
+        if (!permit.allowed()) {
+            if (degradeAllowed) {
+                // 降级结果：可读可分辨，但不写入幂等记录——上游恢复后同键真实请求仍要生效
+                log.info("[{}] matched rule=degraded-response basis='circuit {}, serving distinguishable "
+                        + "degraded result; NOT committed to idempotency store'",
+                        requestId, permit.state());
+                return GatewayResponse.degraded(requestId, adapter.version(), summary(order));
+            }
+            throw new ApiException(ErrorCode.CIRCUIT_OPEN,
+                    "dependency circuit is " + permit.state() + "; retry after cooldown",
+                    permit.retryAfterMillis());
+        }
+
+        // 5. 上游调用（带超时与一次重试，重试携带同一幂等键，不产生重复副作用）
+        // 未携带幂等键时按请求生成一次性键：保证重试仍同键、上游去重表不会遇到 null
+        String upstreamKey = (idempotencyKey == null || idempotencyKey.isBlank())
+                ? "req-" + requestId : idempotencyKey;
+        UpstreamReceipt receipt;
+        try {
+            receipt = invokeUpstreamWithTimeout(requestId, upstreamKey, order);
+        } catch (ApiException e) {
+            if (isUpstreamFailure(e.code())) {
+                breaker.onFailure();
+                log.info("[{}] matched rule=circuit-failure-recorded basis='{} counted for dependency {}'",
+                        requestId, e.code(), dependencyName);
+            }
+            throw e;
+        }
+        breaker.onSuccess();
         idempotencyStore.putIfAbsent(idempotencyKey, receipt);
         log.info("[{}] request completed: rule=upstream-call basis='receipt committed' receipt={}",
                 requestId, receipt);
         return new GatewayResponse(requestId, adapter.version(), summary(order), false, receipt);
+    }
+
+    private static boolean isUpstreamFailure(ErrorCode code) {
+        return code == ErrorCode.UPSTREAM_TIMEOUT
+                || code == ErrorCode.UPSTREAM_ERROR
+                || code == ErrorCode.UPSTREAM_MALFORMED_RESPONSE;
     }
 
     private UpstreamReceipt invokeUpstreamWithTimeout(String requestId, String key, InternalOrder order) {
