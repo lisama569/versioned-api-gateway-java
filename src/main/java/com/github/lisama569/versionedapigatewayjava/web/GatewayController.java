@@ -20,8 +20,10 @@ public class GatewayController {
     public GatewayResponse createOrder(@RequestHeader(name = "X-Api-Version", required = false) String version,
                                        @RequestHeader(name = "X-Caller-Id", required = false) String callerId,
                                        @RequestHeader(name = "X-Idempotency-Key", required = false) String idempotencyKey,
+                                       @RequestHeader(name = "X-Degradation-Allowed", required = false) String degradationAllowed,
                                        @RequestBody String rawJson) {
         String requestId = UUID.randomUUID().toString();
-        return gatewayService.process(requestId, version, callerId, idempotencyKey, rawJson);
+        return gatewayService.process(requestId, version, callerId, idempotencyKey, rawJson,
+                Boolean.parseBoolean(degradationAllowed));
     }
 }

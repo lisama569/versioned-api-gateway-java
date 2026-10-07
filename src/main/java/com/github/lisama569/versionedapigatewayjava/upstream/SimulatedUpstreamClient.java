@@ -47,7 +47,7 @@ public class SimulatedUpstreamClient implements UpstreamClient {
             case TIMEOUT_AFTER_SIDE_EFFECT -> {
                 // 已生效后响应挂起：记录副作用与凭证，再挂起；重试时命中回放
                 UpstreamReceipt receipt = new UpstreamReceipt("UP-" + seq, "ACCEPTED");
-                if (processed.putIfAbsent(idempotencyKey, receipt) == null) {
+                if (!hasKey(idempotencyKey) || processed.putIfAbsent(idempotencyKey, receipt) == null) {
                     effectCount.incrementAndGet();
                 }
                 hang();
@@ -66,6 +66,11 @@ public class SimulatedUpstreamClient implements UpstreamClient {
                     }
                 }
                 UpstreamReceipt receipt = new UpstreamReceipt("UP-" + seq, "ACCEPTED");
+                if (!hasKey(idempotencyKey)) {
+                    // 无幂等键：一次性请求，不做去重
+                    effectCount.incrementAndGet();
+                    return receipt;
+                }
                 UpstreamReceipt existing = processed.putIfAbsent(idempotencyKey, receipt);
                 if (existing == null) {
                     effectCount.incrementAndGet();
@@ -76,6 +81,10 @@ public class SimulatedUpstreamClient implements UpstreamClient {
             default -> throw new IllegalStateException("unknown kind " + kind);
         }
         throw new IllegalStateException("unreachable");
+    }
+
+    private static boolean hasKey(String idempotencyKey) {
+        return idempotencyKey != null && !idempotencyKey.isBlank();
     }
 
     private static void hang() {
